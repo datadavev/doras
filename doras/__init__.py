@@ -23,23 +23,6 @@ def get_logger():
     return logging.getLogger("doras")
 
 
-class OciRedirectAuth(httpx.Auth):
-    """
-    Custom HTTPX Authentication manager that provides the Bearer token
-    ONLY when the request matches the primary OCI registry domain.
-    """
-
-    def __init__(self, token: str, registry_host: str):
-        self.token = token
-        self.registry_host = registry_host
-
-    def auth_flow(self, request: httpx.Request) -> io.BytesIO:
-        # Only inject the token if we are hitting the OCI registry directly
-        if urlparse(str(request.url)).netloc == self.registry_host:
-            request.headers["Authorization"] = f"Bearer {self.token}"
-        yield request
-
-
 class AuthenticatedRegistryStream(io.RawIOBase):
     """
     A loop-proof byte-range stream reader that resolves the GHCR storage redirect
@@ -200,12 +183,6 @@ class Doras:
 
             return response.json().get("token")
 
-    # def _get_authenticated_headers(self) -> Dict[str, str]:
-    #     """Generates standard OCI basic auth headers for httpx and ratarmountcore."""
-    #     auth_str = f"{self.username}:{self.token}"
-    #     b64_auth = base64.b64encode(auth_str.encode()).decode()
-    #     return {"Authorization": f"Basic {b64_auth}"}
-
     def _fetch_manifest(self, version_tag: str) -> Dict[str, Any]:
         """Fetches raw OCI manifest directly using httpx."""
         _L = get_logger()
@@ -226,6 +203,57 @@ class Doras:
                     f"Failed fetching manifest for tag '{version_tag}': {response.text}"
                 )
             return response.json()
+
+    def list_repository_versions(self) -> List[str]:
+        """
+        Queries the registry to retrieve all available version tags for the repository.
+        Returns a list of tags sorted chronologically/semantically if possible, or empty list.
+        """
+        _L = get_logger()
+        url = f"https://{self.host}/v2/{self.repo}/tags/list"
+
+        # Negotiate a pull-scoped bearer token specifically for listing repository metadata
+        scope = f"repository:{self.repo}:pull"
+        bearer_token = self._get_bearer_token(service=self.host, scope=scope)
+
+        headers = {
+            "Authorization": f"Bearer {bearer_token}",
+            "Accept": "application/json",
+        }
+
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(url, headers=headers)
+
+            if response.status_code == 404:
+                # Many OCI registries return 404 if the repository exists but contains no tags yet
+                return []
+
+            if response.status_code != 200:
+                raise Exception(
+                    f"Failed to list repository tags: {response.status_code} - {response.text}"
+                )
+
+            data = response.json()
+            tags = data.get("tags", [])
+            _L.debug("data = %s", data)
+
+            # If the tags are None or empty, return an empty list safely
+            if not tags:
+                return []
+
+            # Optional: Most OCI registries return tags in alphanumeric or creation order,
+            # but it is safest to return them explicitly sorted for deterministic union stacks.
+            try:
+                # This sorts simple semantic tags (e.g., v1, v2, v10) cleanly
+                return sorted(
+                    tags,
+                    key=lambda s: [
+                        int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)
+                    ],
+                )
+            except Exception:
+                # Fallback to standard alphanumeric sort if tags contain complex strings
+                return sorted(tags)
 
     def get_version_sources(
         self, version_tags: List[str], stream_data: bool = False
@@ -372,7 +400,7 @@ class Doras:
         then making a single direct HTTP Range request against the ORAS storage node.
         """
         _L = get_logger()
-        # 1. Open using LOCAL metadata only (Instant, no network calls)
+        # Open using LOCAL metadata only (Instant, no network calls)
         sources = self.get_version_sources(target_versions, stream_data=False)
 
         tar_offset = None

@@ -75,20 +75,37 @@ def build_and_push(
     broker.push_version(image_version, source_path=source_path, is_tar=is_tar)
 
 
+@main.command("versions")
+@click.pass_context
+def list_packcge_versions(ctx):
+    """List the versions of a package."""
+    broker = ctx.obj["broker"]
+    listing = broker.list_repository_versions()
+    for entry in listing:
+        print(entry)
+
+
 @main.command("ls")
 @click.pass_context
 @click.option(
-    "-v", "--version", "image_version", default="v1", help="Version", multiple=True
+    "-v", "--version", "image_version", default=None, help="List contents for version."
 )
-def list_packcge(ctx, image_version: list[str]):
+def list_packcge(ctx, image_version: str | None):
     """List the contents of a package.
 
     Specify versions in chronological order. The listing will be representative
     of the most recent specified version.
     """
+    _L = get_logger()
     broker = ctx.obj["broker"]
+    versions = list(reversed(broker.list_repository_versions()))
+    if image_version is not None:
+        if image_version not in versions:
+            _L.error("No version: '%'", image_version)
+            return
+        versions = versions[versions.index(image_version) :]
     listing = broker.list_files_at_version(
-        image_version,
+        versions,
         path="/",
     )
     for entry in listing:
@@ -99,18 +116,25 @@ def list_packcge(ctx, image_version: list[str]):
 @click.pass_context
 @click.argument("file_name")
 @click.option(
-    "-v", "--version", "image_version", default="v1", help="Version", multiple=True
+    "-v", "--version", "image_version", default=None, help="List contents for version."
 )
-def get_file_from_package(ctx, file_name: str, image_version: list[str]):
+def get_file_from_package(ctx, file_name: str, image_version: str | None):
     """Retrieve an object from the the OCI image.
 
     The object is retrieved directly from the corresponding OCI layer using byte
     range requests.
     """
+    _L = get_logger()
     broker = ctx.obj["broker"]
+    versions = list(reversed(broker.list_repository_versions()))
+    if image_version is not None:
+        if image_version not in versions:
+            _L.error("No version: '%'", image_version)
+            return
+        versions = versions[versions.index(image_version) :]
     print(
         broker.read_file_from_version(
-            image_version,
+            versions,
             file_name,
         )
     )
