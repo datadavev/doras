@@ -62,6 +62,9 @@ def build_and_push(
     source_path: pathlib.Path,
     image_version: str,
 ):
+    """Push an archive to ORAS.
+
+    A new image is created if it doesn't exist, or a new version layer is added if the image already exists."""
     _L = get_logger()
     source_path = pathlib.Path(source_path)
     _L.debug("Source = %s", source_path)
@@ -78,6 +81,11 @@ def build_and_push(
     "-v", "--version", "image_version", default="v1", help="Version", multiple=True
 )
 def list_packcge(ctx, image_version: list[str]):
+    """List the contents of a package.
+
+    Specify versions in chronological order. The listing will be representative
+    of the most recent specified version.
+    """
     broker = ctx.obj["broker"]
     listing = broker.list_files_at_version(
         image_version,
@@ -90,14 +98,19 @@ def list_packcge(ctx, image_version: list[str]):
 @main.command("get")
 @click.pass_context
 @click.argument("file_name")
-@click.option("-v", "--version", "image_version", default="v1", help="Version")
-def get_file_from_package(ctx, file_name, image_version):
+@click.option(
+    "-v", "--version", "image_version", default="v1", help="Version", multiple=True
+)
+def get_file_from_package(ctx, file_name: str, image_version: list[str]):
+    """Retrieve an object from the the OCI image.
+
+    The object is retrieved directly from the corresponding OCI layer using byte
+    range requests.
+    """
     broker = ctx.obj["broker"]
     print(
         broker.read_file_from_version(
-            [
-                image_version,
-            ],
+            image_version,
             file_name,
         )
     )
