@@ -4,19 +4,26 @@ import logging
 import os
 import pathlib
 import stat
+import sys
 import tarfile
 from contextlib import closing
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
+import fsspec
+import fsspec.registry
 import httpx
+import ratarmount
+import ratarmount.cli
+from mfusepy import FUSE
 from oras.client import OrasClient
 from PySquashfsImage.structure import sizeof
-
-# Correct Top-Level Namespace Imports
+from ratarmount import FuseMount
 from ratarmountcore.mountsource.compositing.union import UnionMountSource
 from ratarmountcore.mountsource.factory import open_mount_source
 from ratarmountcore.mountsource.formats.tar import SQLiteIndexedTar
+
+from doras import dfsspec, utils
 
 
 def get_logger():
@@ -157,31 +164,7 @@ class Doras:
         """
         Dynamically requests an OAuth2 Bearer token from the registry's auth endpoint.
         """
-        # Resolve the challenge endpoint (GHCR and Quay use slightly different auth servers)
-        if "ghcr.io" in self.host:
-            auth_url = "https://ghcr.io/token"
-            params = {"service": "ghcr.io", "scope": scope}
-        elif "quay.io" in self.host:
-            auth_url = "https://quay.io/v2/auth"
-            params = {"service": "quay.io", "scope": scope}
-        else:
-            # Fallback deduction for generic registries
-            auth_url = f"https://{self.host}/v2/auth"
-            params = {"service": self.host, "scope": scope}
-
-        # Basic Auth is used *only* to request the bearer token
-        auth_str = f"{self.username}:{self.token}"
-        b64_auth = base64.b64encode(auth_str.encode()).decode()
-        headers = {"Authorization": f"Basic {b64_auth}"}
-
-        with httpx.Client(timeout=10.0) as client:
-            response = client.get(auth_url, params=params, headers=headers)
-            if response.status_code != 200:
-                raise PermissionError(
-                    f"OAuth2 Token exchange failed with registry: {response.text}"
-                )
-
-            return response.json().get("token")
+        return utils.get_bearer_token(service, self.username, self.token, scope)
 
     def _fetch_manifest(self, version_tag: str) -> Dict[str, Any]:
         """Fetches raw OCI manifest directly using httpx."""
@@ -377,21 +360,6 @@ class Doras:
             print(f"Error recursively walking index: {e}")
             return []
 
-    # def read_file_from_version(
-    #     self, target_versions: List[str], file_path: str
-    # ) -> bytes:
-    #     """Streams only the required byte chunks for a specific file across the network."""
-    #     # Pass stream_data=True because we are actively extracting file content payloads
-    #     sources = self.get_version_sources(target_versions, stream_data=True)
-
-    #     union = UnionMountSource(sources)
-    #     absolute_path = file_path if file_path.startswith("/") else f"/{file_path}"
-    #     file_info = union.lookup(absolute_path)
-    #     if file_info is not None:
-    #         with union.open(file_info) as f:
-    #             return f.read()
-    #     raise KeyError(f"File not found for {absolute_path}")
-
     def read_file_from_version(
         self, target_versions: List[str], file_path: str
     ) -> bytes:
@@ -457,7 +425,7 @@ class Doras:
         )
         _L.info("Fetching bytes directly from remote storage layer...")
 
-        # 2. Fetch the manifest for the specific version that owns the file
+        # Fetch the manifest for the specific version that owns the file
         manifest = self._fetch_manifest(target_tag)
         tar_digest = None
         for layer in manifest.get("layers", []):
@@ -474,7 +442,7 @@ class Doras:
                 f"Could not find the target TAR layer for version {target_tag}"
             )
 
-        # 3. Resolve the direct GHCR/Quay signed storage backend URL (No Range header yet)
+        # Resolve the direct GHCR/Quay signed storage backend URL (No Range header yet)
         remote_blob_url = f"https://{self.host}/v2/{self.repo}/blobs/{tar_digest}"
         scope = f"repository:{self.repo}:pull"
         bearer_token = self._get_bearer_token(service=self.host, scope=scope)
@@ -495,7 +463,7 @@ class Doras:
                     f"Failed to resolve blob storage redirect: {response.status_code}"
                 )
 
-        # 4. Fire a single, targeted HTTP Range request directly at the storage provider
+        # Fire a single, targeted HTTP Range request directly at the storage provider
         # Calculate the exact byte window: start_at_offset to (offset + size - 1)
         end_byte = tar_offset + file_size - 1
         range_header = f"bytes={tar_offset}-{end_byte}"
@@ -598,3 +566,288 @@ class Doras:
         finally:
             if tmp_tar_created and os.path.exists(final_tar_upload):
                 os.remove(final_tar_upload)
+
+    def mount_backup_stack(self, target_versions: List[str], local_mount_point: str):
+        """
+        Dynamically extracts the asset paths from the version indices,
+        maps them to the custom fsspec protocol, and mounts the entire combined
+        history as a standard local directory via FUSE-T / ratarmount CLI.
+        """
+
+        fsspec.register_implementation(
+            "doras", dfsspec.OrasRegistryFileSystem, clobber=True
+        )
+
+        # 1. Seeding your active credentials into fsspec's universal runtime configuration layer.
+        # This acts as a background hook whenever ratarmount's internal workers call fsspec
+        fsspec.config.conf["doras"] = {"username": self.username, "token": self.token}
+        os.environ["ORAS_USERNAME"] = self.username
+        os.environ["ORAS_TOKEN"] = self.token
+
+        # fs = fsspec.filesystem("doras", username=self.username, token=self.token)
+
+        # 2. Build the exact token arguments list matching ratarmount terminal syntax
+        index_args = []
+        layer_uris = []
+        interleaved_args = []
+
+        print(f"Resolving OCI layers dynamically for versions: {target_versions}...")
+
+        chronological_stack = list(reversed(target_versions))
+
+        for tag in chronological_stack:
+            manifest = self._fetch_manifest(tag)
+
+            tar_digest = None
+            index_digest = None
+            index_filename = None
+
+            for layer in manifest.get("layers", []):
+                title = layer.get("annotations", {}).get(
+                    "org.opencontainers.image.title", ""
+                )
+                if title.endswith(".index.sqlite"):
+                    index_digest = layer["digest"]
+                    index_filename = f"{tag}_{title}"
+                elif title.endswith(".tar"):
+                    tar_digest = layer["digest"]
+
+            if not tar_digest or not index_digest or not index_filename:
+                raise ValueError(f"Tag {tag} does not contain valid backup layers.")
+
+            cached_index_path = os.path.join(self.cache_dir, index_filename)
+
+            # Ensure index map metadata is downloaded locally
+            if not os.path.exists(cached_index_path):
+                print(f"[{tag}] Index missing from cache. Pulling...")
+                self.oras_client.download_blob(
+                    container=f"{self.host}/{self.repo}",
+                    digest=index_digest,
+                    outfile=cached_index_path,
+                )
+
+            # Construct the dynamic fsspec string URL
+            dynamic_layer_url = f"doras://{self.host}/{self.repo}/blobs/{tar_digest}"
+
+            # Append the specific index-to-layer pair arguments directly to the CLI map array
+            index_args.extend(["--index-file", cached_index_path])
+            layer_uris.append(dynamic_layer_url)
+            interleaved_args.extend(
+                ["--index-file", cached_index_path, dynamic_layer_url]
+            )
+
+        # Append the final target mount location parameter
+        os.makedirs(local_mount_point, exist_ok=True)
+        cli_args = (
+            []
+            + [
+                "--foreground",
+                "-d",
+                "3",
+            ]
+            + index_args
+            + layer_uris
+            + [local_mount_point]
+        )
+        cli_args = (
+            []
+            + [
+                "--foreground",
+                "-d",
+                "3",
+            ]
+            + interleaved_args
+            + [local_mount_point]
+        )
+
+        print(f"\nExecuting native ratarmount core bridge with arguments:")
+        print(f"ratarmount {' '.join([str(a) for a in cli_args])}\n")
+
+        try:
+            ratarmount.cli.cli(cli_args)
+        except KeyboardInterrupt:
+            print("\nUnmounting filesystem loop securely...")
+
+    def mount_backup_stack2(self, target_versions: List[str], local_mount_point: str):
+        """
+        Bypasses the strict string-URL restrictions of the CLI tool
+        by programmatically wiring the custom fsspec handlers directly to FUSE.
+        """
+        # from fuse import FUSE
+        # from ratarmountcore import UnionMountSource, open_mount_source
+
+        # 1. Initialize custom filesystem logic
+        fsspec.config.conf["doras"] = {"username": self.username, "token": self.token}
+
+        # Instantiate your driver manually so we aren't relying on the CLI auto-resolver
+        fs = fsspec.filesystem("doras", username=self.username, token=self.token)
+
+        mount_sources = []
+
+        print(f"Resolving OCI layers dynamically for versions: {target_versions}...")
+
+        for tag in target_versions:
+            # ... [Your manifest evaluation loop here to get tar_digest and index_digest] ...
+            manifest = self._fetch_manifest(tag)
+            tar_digest = None
+            index_digest = None
+            index_filename = None
+
+            for layer in manifest.get("layers", []):
+                title = layer.get("annotations", {}).get(
+                    "org.opencontainers.image.title", ""
+                )
+                if title.endswith(".index.sqlite"):
+                    index_digest = layer["digest"]
+                    index_filename = f"{tag}_{title}"
+                elif title.endswith(".tar"):
+                    tar_digest = layer["digest"]
+
+            cached_index_path = os.path.join(self.cache_dir, index_filename)
+
+            # Formulate the dynamic target string URL
+            dynamic_layer_url = f"doras://{self.host}/{self.repo}/blobs/{tar_digest}"
+
+            print(f"  -> Mapping virtual layer stream: {dynamic_layer_url}")
+
+            # FIXED BYPASS: Open the filesystem file handle directly using our explicit 'fs' instance!
+            # By passing the active stream handle instead of a plain text string URL,
+            # we completely circumvent ratarmount's strict command-line parsing checks.
+            virtual_file_handle = fs.open(dynamic_layer_url, mode="rb")
+
+            source = open_mount_source(
+                virtual_file_handle,  # Pass the direct file object stream!
+                index_path=cached_index_path,
+                write_index=False,
+            )
+            mount_sources.append(source)
+
+        # 2. Combine the layers into our master union view
+        print("Assembling union filesystem layout...")
+        union_source = UnionMountSource(mount_sources)
+
+        # 3. Apply our custom monkey-patch to ensure FUSE-T compatibility on macOS
+        original_statfs = union_source.statfs
+        union_source.statfs = lambda *a, **kw: original_statfs()
+
+        # 4. Trigger the user-space FUSE-T binding block cleanly
+        os.makedirs(local_mount_point, exist_ok=True)
+        print(
+            f"Successfully mounted backup history to local path: '{local_mount_point}'"
+        )
+
+        # macOS FUSE-T arguments configuration block
+        fuse_kwargs = {
+            "foreground": True,
+            "nothreads": True,
+            "raw_fi": True,
+        }
+
+        try:
+            FUSE(union_source, local_mount_point, **fuse_kwargs)
+        except KeyboardInterrupt:
+            print("\nUnmounting filesystem loop securely...")
+
+    def mount_backup_stack3(self, target_versions: List[str], local_mount_point: str):
+        """
+        Bypasses the CLI argument bugs by programmatically building the
+        UnionMountSource using pre-authenticated fsspec file streams,
+        then binds it to FUSE-T on macOS.
+        """
+        # from ratarmountcore import UnionMountSource, open_mount_source
+
+        # 1. Establish custom protocol configurations globally
+        fsspec.register_implementation(
+            "doras", "doras.OrasRegistryFileSystem", clobber=True
+        )
+        fsspec.config.conf["doras"] = {"username": self.username, "token": self.token}
+
+        # Instantiate your custom driver manually
+        fs = fsspec.filesystem("doras", username=self.username, token=self.token)
+
+        mount_sources = []
+
+        # Chronological sorting: Oldest layers go on the left, newest on the right
+        # so that recent file changes cleanly overwrite older ones in the union.
+        chronological_stack = list(reversed(target_versions))
+
+        print(f"Resolving OCI layers in chronological order: {chronological_stack}...")
+
+        for tag in chronological_stack:
+            manifest = self._fetch_manifest(tag)
+
+            tar_digest = None
+            index_digest = None
+            index_filename = None
+
+            for layer in manifest.get("layers", []):
+                title = layer.get("annotations", {}).get(
+                    "org.opencontainers.image.title", ""
+                )
+                if title.endswith(".index.sqlite"):
+                    index_digest = layer["digest"]
+                    index_filename = f"{tag}_{title}"
+                elif title.endswith(".tar"):
+                    tar_digest = layer["digest"]
+
+            if not tar_digest or not index_digest or not index_filename:
+                raise ValueError(f"Tag {tag} does not contain valid backup layers.")
+
+            cached_index_path = os.path.join(self.cache_dir, index_filename)
+
+            # Pull down the index if it is missing from the local layout cache
+            if not os.path.exists(cached_index_path):
+                print(f"[{tag}] Index missing from cache. Pulling...")
+                self.oras_client.download_blob(
+                    container=f"{self.host}/{self.repo}",
+                    digest=index_digest,
+                    outfile=cached_index_path,
+                )
+
+            # Construct the target layer stream location URL
+            dynamic_layer_url = f"doras://{self.host}/{self.repo}/blobs/{tar_digest}"
+            print(f"  -> Mapping virtual stream: {dynamic_layer_url}")
+
+            # 2. Open an un-buffered read-only file handle from the custom fsspec driver
+            virtual_file_handle = fs.open(dynamic_layer_url, mode="rb")
+
+            # 3. Explicitly pair this exact network file handle with its specific local index file.
+            # This bypasses the command line entirely, keeping all metadata mappings fully intact!
+            source = open_mount_source(
+                virtual_file_handle,
+                index_path=cached_index_path,
+                write_index=False,
+            )
+            mount_sources.append(source)
+
+        # 4. Programmatically combine the isolated layers into a master union view
+        print("Assembling program-level union filesystem layout...")
+        union_source = UnionMountSource(mount_sources)
+
+        # 5. Apply the monkey patch to prevent FUSE-T statfs parameter signature exceptions
+        original_statfs = union_source.statfs
+        union_source.statfs = lambda *args, **kwargs: original_statfs()
+
+        # 6. Bind the programmatic Union Mount directly to the macOS user space via FUSE-T
+        os.makedirs(local_mount_point, exist_ok=True)
+        print(
+            f"\nSuccessfully mounted consolidated backup history to: '{local_mount_point}'"
+        )
+        print("Press Ctrl+C inside this terminal window to unmount.")
+
+        # Specialized configuration parameters to interface safely with FUSE-T on macOS
+        if sys.platform == "darwin":
+            os.environ["DYLD_LIBRARY_PATH"] = "/usr/local/lib"
+            kwargs = {
+                "foreground": True,
+                "nothreads": True,
+                "raw_fi": True,
+            }
+        else:
+            kwargs = {"foreground": True, "ro": True, "nothreads": True}
+
+        try:
+            # Trigger the blocking FUSE kernel runtime daemon
+            FUSE(union_source, local_mount_point, **kwargs)
+        except KeyboardInterrupt:
+            print("\nUnmounting multi-version filesystem loop securely...")

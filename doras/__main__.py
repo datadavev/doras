@@ -17,21 +17,29 @@ def get_logger() -> logging.Logger:
 @click.option(
     "-u",
     "--user",
-    "gh_user",
+    "user",
     default=None,
-    envvar="GITHUB_USERNAME",
+    envvar="ORAS_USERNAME",
     help="GitHub username",
 )
 @click.option(
     "-t",
     "--token",
-    "gh_token",
+    "token",
     default=None,
-    envvar="GITHUB_TOKEN",
+    envvar="ORAS_TOKEN",
     help="GitHub personal access token",
 )
+@click.option(
+    "-h",
+    "--host",
+    "host",
+    default="ghcr.io",
+    envvar="ORAS_HOST",
+    help="ORAS registry host",
+)
 @click.argument("package_name")
-def main(ctx, log_level, gh_user, gh_token, package_name) -> None:
+def main(ctx, log_level, user, token, host, package_name) -> None:
     # Set up logging
     if log_level is None:
         log_level = "DEBUG"
@@ -45,10 +53,10 @@ def main(ctx, log_level, gh_user, gh_token, package_name) -> None:
     ctx.ensure_object(dict)
     cache_dir = pathlib.Path(".doras").resolve()
     ctx.obj["broker"] = doras.Doras(
-        registry_host="ghcr.io",
-        repository=f"{gh_user}/{package_name}",
-        username=gh_user,
-        token=gh_token,
+        registry_host=host,
+        repository=f"{user}/{package_name}",
+        username=user,
+        token=token,
         cache_dir=cache_dir,
     )
 
@@ -138,6 +146,25 @@ def get_file_from_package(ctx, file_name: str, image_version: str | None):
             file_name,
         )
     )
+
+
+@main.command("mount")
+@click.pass_context
+@click.argument("mount_point")
+@click.option(
+    "-v", "--version", "image_version", default=None, help="List contents for version."
+)
+def mount_package(ctx, mount_point, image_version):
+    """Mount the package as a file system."""
+    _L = get_logger()
+    broker = ctx.obj["broker"]
+    versions = list(reversed(broker.list_repository_versions()))
+    if image_version is not None:
+        if image_version not in versions:
+            _L.error("No version: '%'", image_version)
+            return
+        versions = versions[versions.index(image_version) :]
+    broker.mount_backup_stack3(versions, mount_point)
 
 
 if __name__ == "__main__":

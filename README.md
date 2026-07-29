@@ -1,6 +1,6 @@
 # ORAS Experiment
 
-This is an experiment leveraging the GHCR ORAS repository to store datasets in a way where individual
+This is an experiment leveraging the GHCR ORAS repository to store datasets such that individual
 files within an OCI layer are individually addressable.
 
 ```
@@ -10,10 +10,13 @@ Options:
   -L, --log-level TEXT  Set the logging level (INFO)
   -u, --user TEXT       GitHub username
   -t, --token TEXT      GitHub personal access token
+  -h, --host TEXT       ORAS registry host
   --help                Show this message and exit.
 
 Commands:
-  get   Retrieve an object from the the OCI image.
-  ls    List the contents of a package.
-  push  Push an archive to ORAS.
+  get       Retrieve an object from the the OCI image.
+  ls        List the contents of a package.
+  mount     Mount the package as a file system.
+  push      Push an archive to ORAS.
+  versions  List the versions of a package.
 ```
